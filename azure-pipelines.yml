@@ -1,0 +1,167 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  - group: AzCred  # Group of variables for Azure credentials
+
+stages:
+- stage: CI
+  displayName: "Terraform CI Pipeline"
+  jobs:
+  - job: terraform_ci
+    displayName: "CI Job - Terraform Init, Validate, and Plan"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+
+      - task: Bash@3
+        displayName: "Install Azure CLI"
+        inputs:
+          targetType: 'inline'
+          script: |
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+            az --version
+
+      - task: Bash@3
+        displayName: "Install Terraform"
+        inputs:
+          targetType: 'inline'
+          script: |
+            T_VERSION="1.9.8"
+            curl -O https://releases.hashicorp.com/terraform/${T_VERSION}/terraform_${T_VERSION}_linux_amd64.zip
+            unzip terraform_${T_VERSION}_linux_amd64.zip
+            sudo mv terraform /usr/local/bin/
+            terraform -version
+
+      - task: Bash@3
+        displayName: "Azure Login"
+        inputs:
+          targetType: 'inline'
+          script: |
+            az login --service-principal -u $(ARM_CLIENT_ID) -p $(ARM_CLIENT_SECRET) --tenant $(ARM_TENANT_ID)
+            az account set --subscription $(ARM_SUBSCRIPTION_ID)
+
+      - task: Bash@3
+        displayName: "Terraform Init"
+        inputs:
+          targetType: 'inline'
+          script: |
+            terraform init -lock=false
+
+      - task: Bash@3
+        displayName: "Terraform Validate"
+        inputs:
+          targetType: 'inline'
+          script: |
+            terraform validate -no-color
+
+      - task: Bash@3
+        displayName: "Terraform Plan"
+        inputs:
+          targetType: 'inline'
+          script: |
+            terraform plan -no-color -input=false -lock=false
+
+- stage: CD
+  displayName: "Terraform CD Pipeline"
+  dependsOn: CI
+  condition: succeeded()
+  jobs:
+  - deployment: terraform_cd
+    displayName: "CD Job - Terraform Apply"
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'Production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            - task: Bash@3
+              displayName: "Azure Login"
+              inputs:
+                targetType: 'inline'
+                script: |
+                  az login --service-principal -u $(ARM_CLIENT_ID) -p $(ARM_CLIENT_SECRET) --tenant $(ARM_TENANT_ID)
+                  az account set --subscription $(ARM_SUBSCRIPTION_ID)
+
+            - task: Bash@3
+              displayName: "Run Terraform Init, Validate, and Plan"
+              inputs:
+                targetType: 'inline'
+                script: |
+                  terraform init -lock=false
+                  terraform validate
+                  terraform plan -out=tfplan.out -lock=false
+
+            - task: Bash@3
+              displayName: "Terraform Apply"
+              inputs:
+                targetType: 'inline'
+                script: |
+                  terraform apply --auto-approve -lock=false tfplan.out
+
+- stage: BuildAndDeploy
+  displayName: "Build .NET Project and Deploy Docker Container"
+  jobs:
+  - job: buildAndDeploy
+    displayName: "Build .NET Project and Deploy"
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+      - checkout: self
+
+      # Step to list .csproj files and confirm the path
+      - task: Bash@3
+        displayName: 'List .csproj Files'
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "Listing all .csproj files"
+            find . -name "*.csproj"
+
+      - task: UseDotNet@2
+        inputs:
+          packageType: 'sdk'
+          version: '7.x'
+          installationPath: $(Agent.ToolsDirectory)/dotnet
+
+      - script: |
+          dotnet build ./ASPNETCore-WebAPI-Sample/SampleWebApiAspNetCore.csproj --configuration Release
+        displayName: 'Build .NET Project'
+
+      - script: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker --version
+        displayName: 'Install Docker'
+
+      - script: |
+          DOCKER_COMPOSE_VERSION="1.29.2"
+          sudo curl -L "https://github.com/docker/compose/releases/download/${DOCKER_COMPOSE_VERSION}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          docker-compose --version
+        displayName: 'Install Docker Compose'
+
+      - script: |
+          docker-compose -f ./ASPNETCore-WebAPI-Sample/docker-compose.yml build
+        displayName: 'Build Docker Image using Docker Compose'
+
+      - script: |
+          echo $(servicePrincipalKey) | az login --service-principal --username $(servicePrincipalId) --password $(servicePrincipalKey) --tenant $(tenantId)
+          az webapp config container set \
+            --name $(appServiceName) \
+            --resource-group $(resourceGroup) \
+            --docker-custom-image-name $(dockerHubUsername)/$(dockerImageName):latest
+        displayName: 'Deploy Docker Container to Azure Web App'
